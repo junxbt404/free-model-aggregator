@@ -20,8 +20,10 @@
 //     least likely, while the strongest models still take the requests they matter most to.
 //     The risk price of a call number is the exact posterior over the kit's published draw:
 //     every budget, refusal set and outage start the draw can produce for that provider,
-//     weighted as the draw weights them and filtered by the outcomes seen so far, sharpened
-//     by the two couplings (one designated second-call refuser, one outage provider) and, at
+//     weighted as the draw weights them and filtered by the outcomes seen so far, under the
+//     joint posterior over the draw's two global choices (which provider is the designated
+//     second-call refuser, which is the outage provider: 100 assignments, reweighted by every
+//     provider's evidence at once) and, at
 //     first, by the practice instance's published schedule, which the first contradicting
 //     outcome retires. A provider leaves the plan only when every schedule still consistent
 //     with its outcomes refuses all its remaining calls. If the plan's own
@@ -145,6 +147,9 @@ const attempts = new Map<string, number>();
 const deadProviders = new Set<string>();
 /** Every inference outcome per provider, by call number (index = call number - 1): true where it answered. */
 const outcomes = new Map<string, boolean[]>();
+/** Quality banked by the requests already answered: Σ weight × rating earned, and Σ weight × best legal rating. */
+let servedEarned = 0;
+let servedBound = 0;
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -242,55 +247,68 @@ function bestModelFor(providerIndex: number, api: ClientWire, requires: Requirem
 }
 
 /**
- * One possible hidden schedule for a provider: its budget, its one or two scheduled refusal
- * slots, and the slot its outage starts at (null when it is not the outage provider).
+ * One possible hidden schedule for a provider, tagged with the two global choices it belongs
+ * to: its budget, its one or two scheduled refusal slots, and the slot its outage starts at
+ * (null unless this schedule is on the outage branch). The weight is the draw's own weight
+ * for the schedule within its branch; the one-in-ten chances of being the designated or the
+ * outage provider are NOT folded in here, because the draw makes those two choices once for
+ * the whole trial — the joint posterior applies them globally instead.
  */
-interface Hypothesis {
+interface RawHypothesis {
   budget: number;
   fails: number[];
   outage: number | null;
+  designated: boolean;
+  outageBranch: boolean;
   weight: number;
 }
 
 /** Whether schedule `h` refuses call number `s`: scheduled, outaged, or over budget. */
-function hypFails(h: Hypothesis, s: number): boolean {
+function hypFails(h: RawHypothesis, s: number): boolean {
   return s > h.budget || h.fails.includes(s) || (h.outage !== null && s >= h.outage);
 }
 
+const rawHypCache = new Map<string, RawHypothesis[]>();
+
 /**
- * Every schedule the kit's published draw can produce for one provider, weighted as the draw
- * weights it: the budget uniform over its range; one or two distinct refusal slots uniform
- * over 2..budget-1; a one-in-ten chance this provider is the designated one, whose refusal
- * set is forced to contain slot 2 (a drawn set without 2 has its smallest member swapped for
- * 2, exactly as the generator does); a one-in-ten chance it is the outage provider, its
- * outage then uniform over 2..budget-1.
+ * Every schedule the kit's published draw can produce for one provider, split by branch:
+ * the budget uniform over its range; one or two distinct refusal slots uniform over
+ * 2..budget-1; on the designated branch the drawn set is forced to contain slot 2 (a set
+ * without 2 has its smallest member swapped for 2, exactly as the generator does, and sets
+ * that collide after the swap add their weights); on the outage branch the outage start is
+ * uniform over 2..budget-1.
  */
-function hypothesesFor(providerId: string): Hypothesis[] {
+function rawHypothesesFor(providerId: string): RawHypothesis[] {
+  const hit = rawHypCache.get(providerId);
+  if (hit !== undefined) return hit;
   const lo = MIN_BUDGET[providerId] ?? 5;
   const hi = MAX_BUDGET[providerId] ?? lo + 2;
-  const out: Hypothesis[] = [];
+  const out: RawHypothesis[] = [];
   for (let budget = lo; budget <= hi; budget++) {
     const slots: number[] = [];
     for (let s = 2; s <= budget - 1; s++) slots.push(s);
     const subsets: number[][] = [];
     for (const s of slots) subsets.push([s]);
     for (let i = 0; i < slots.length; i++) for (let j = i + 1; j < slots.length; j++) subsets.push([slots[i], slots[j]]);
-    const failProb = new Map<string, number>();
+    const failW: Map<string, number>[] = [new Map(), new Map()];
     for (const f0 of subsets) {
       const w = 0.5 / (f0.length === 1 ? slots.length : (slots.length * (slots.length - 1)) / 2);
       const key0 = f0.join(',');
-      failProb.set(key0, (failProb.get(key0) ?? 0) + 0.9 * w);
+      failW[0].set(key0, (failW[0].get(key0) ?? 0) + w);
       const fd = f0.includes(2) ? f0 : [2, ...f0.slice(1)].sort((a, b) => a - b);
       const keyD = fd.join(',');
-      failProb.set(keyD, (failProb.get(keyD) ?? 0) + 0.1 * w);
+      failW[1].set(keyD, (failW[1].get(keyD) ?? 0) + w);
     }
-    for (const [key, pf] of failProb) {
-      const fails = key.split(',').map(Number);
-      const base = pf / (hi - lo + 1);
-      out.push({ budget, fails, outage: null, weight: base * 0.9 });
-      for (let o = 2; o <= budget - 1; o++) out.push({ budget, fails, outage: o, weight: (base * 0.1) / (budget - 2) });
+    for (let d = 0; d <= 1; d++) {
+      for (const [key, wf] of failW[d]) {
+        const fails = key.split(',').map(Number);
+        const base = wf / (hi - lo + 1);
+        out.push({ budget, fails, outage: null, designated: d === 1, outageBranch: false, weight: base });
+        for (let o = 2; o <= budget - 1; o++) out.push({ budget, fails, outage: o, designated: d === 1, outageBranch: true, weight: base / (budget - 2) });
+      }
     }
   }
+  rawHypCache.set(providerId, out);
   return out;
 }
 
@@ -306,88 +324,122 @@ interface Posterior {
 const posteriorCache = new Map<string, { sig: string; post: Posterior }>();
 
 /**
- * The provider's posterior over its hidden schedule: every schedule consistent with the
- * outcomes seen so far, reweighted, and the refusal probability it implies per call number.
- * Cached per outcome history; a provider's history only grows, so the cache key is its
- * outcome string.
+ * One provider's local evidence, split by the two global branches: for each (designated,
+ * outage) combination, the total weight of its schedules consistent with the outcomes seen
+ * so far, the consistent weight refusing each call number, and whether any consistent
+ * schedule answers it. Cached per outcome history; a provider's history only grows, so the
+ * cache key is its outcome string.
  */
-function posterior(providerId: string): Posterior {
-  const obs = outcomes.get(providerId) ?? [];
-  const sig = obs.map((ok) => (ok ? '1' : '0')).join('');
-  const hit = posteriorCache.get(providerId);
-  if (hit !== undefined && hit.sig === sig) return hit.post;
-  const consistent = hypothesesFor(providerId).filter((h) => obs.every((ok, i) => hypFails(h, i + 1) === !ok));
-  const total = consistent.reduce((n, h) => n + h.weight, 0);
-  const hazards: number[] = [0];
-  for (let s = 1; s <= 18; s++) {
-    hazards.push(total === 0 ? (s === 1 ? 0 : 1) : consistent.reduce((n, h) => n + (hypFails(h, s) ? h.weight : 0), 0) / total);
-  }
-  let deadFrom = 19;
-  for (let s = 18; s >= 1; s--) {
-    if (hazards[s] >= 0.999) deadFrom = s;
-    else break;
-  }
-  const outageProb = total === 0 ? 0 : consistent.reduce((n, h) => n + (h.outage !== null ? h.weight : 0), 0) / total;
-  const post: Posterior = { hazards, deadFrom, outageProb };
-  posteriorCache.set(providerId, { sig, post });
-  return post;
+interface LocalView {
+  total: number[][];
+  refuse: number[][][];
+  accepts: boolean[][][];
 }
 
-const noOutageCache = new Map<string, { sig: string; post: Posterior }>();
+const localViewCache = new Map<string, { sig: string; view: LocalView }>();
 
-/** The provider's posterior with the outage possibility removed: the view once another provider is proven to be the outage one. */
-function posteriorNoOutage(providerId: string): Posterior {
+function localView(providerId: string): LocalView {
   const obs = outcomes.get(providerId) ?? [];
   const sig = obs.map((ok) => (ok ? '1' : '0')).join('');
-  const hit = noOutageCache.get(providerId);
-  if (hit !== undefined && hit.sig === sig) return hit.post;
-  const consistent = hypothesesFor(providerId).filter((h) => h.outage === null && obs.every((ok, i) => hypFails(h, i + 1) === !ok));
-  const total = consistent.reduce((n, h) => n + h.weight, 0);
-  const hazards: number[] = [0];
-  for (let s = 1; s <= 18; s++) {
-    hazards.push(total === 0 ? (s === 1 ? 0 : 1) : consistent.reduce((n, h) => n + (hypFails(h, s) ? h.weight : 0), 0) / total);
+  const hit = localViewCache.get(providerId);
+  if (hit !== undefined && hit.sig === sig) return hit.view;
+  const total: number[][] = [
+    [0, 0],
+    [0, 0],
+  ];
+  const refuse: number[][][] = [0, 1].map(() => [0, 1].map(() => new Array<number>(19).fill(0)));
+  const accepts: boolean[][][] = [0, 1].map(() => [0, 1].map(() => new Array<boolean>(19).fill(false)));
+  for (const h of rawHypothesesFor(providerId)) {
+    const failsAt: boolean[] = [false];
+    for (let s = 1; s <= 18; s++) failsAt.push(hypFails(h, s));
+    let consistent = true;
+    for (let i = 0; i < obs.length; i++) {
+      if (failsAt[i + 1] !== !obs[i]) {
+        consistent = false;
+        break;
+      }
+    }
+    if (!consistent) continue;
+    const d = h.designated ? 1 : 0;
+    const o = h.outageBranch ? 1 : 0;
+    total[d][o] += h.weight;
+    for (let s = 1; s <= 18; s++) {
+      if (failsAt[s]) refuse[d][o][s] += h.weight;
+      else accepts[d][o][s] = true;
+    }
   }
-  let deadFrom = 19;
-  for (let s = 18; s >= 1; s--) {
-    if (hazards[s] >= 0.999) deadFrom = s;
-    else break;
-  }
-  const post: Posterior = { hazards, deadFrom, outageProb: 0 };
-  noOutageCache.set(providerId, { sig, post });
-  return post;
+  const view: LocalView = { total, refuse, accepts };
+  localViewCache.set(providerId, { sig, view });
+  return view;
 }
 
-const effCache = new Map<string, { sig: string; post: Posterior }>();
+let globalCache: { sig: string; posts: Map<string, Posterior> } | null = null;
 
 /**
- * The posterior the planner actually uses, sharpened by the two facts that couple the
- * providers: exactly one provider is the designated second-call refuser, and exactly one is
- * the outage provider. A provider that answered its second call is proven not designated;
- * when nine are proven, the tenth's second call certainly refuses. When one provider is
- * proven to be the outage one (its refusals outnumber what any refusal set explains), every
- * other provider's outage possibility is removed.
+ * The joint posterior over the trial's two global choices: which provider is the designated
+ * second-call refuser and which is the outage provider. The draw makes each choice once,
+ * uniformly and independently, so the 100 assignments start equal and every provider's
+ * local evidence reweights them all at once: an answer at call 2 anywhere lowers the
+ * designated probability everywhere else, and refusals that smell of an outage anywhere
+ * discount the outage branch everywhere else — continuously, not only once a coupling is
+ * proven outright. Each provider's hazards, death point and outage probability are read off
+ * the mixture; a provider is dead from the first call number after which no schedule under
+ * any live assignment answers it or any later call.
  */
-function effPosterior(providerId: string): Posterior {
-  const sig = brief.directory.providers.map((p) => (outcomes.get(p.id) ?? []).map((ok) => (ok ? '1' : '0')).join('')).join('|');
-  const hit = effCache.get(providerId);
-  if (hit !== undefined && hit.sig === sig) return hit.post;
-  let post = posterior(providerId);
-  const outageProvenElsewhere = brief.directory.providers.some((p) => p.id !== providerId && posterior(p.id).outageProb >= 0.999);
-  if (outageProvenElsewhere) post = posteriorNoOutage(providerId);
-  const notDesignated = brief.directory.providers.filter((p) => (outcomes.get(p.id) ?? [])[1] === true);
-  const mine = outcomes.get(providerId) ?? [];
-  if (notDesignated.length === 9 && mine[1] === undefined && !notDesignated.some((p) => p.id === providerId)) {
-    const hazards = [...post.hazards];
-    hazards[2] = 1;
+function globalPosteriors(): Map<string, Posterior> {
+  const providers = brief.directory.providers;
+  const sig = providers.map((p) => (outcomes.get(p.id) ?? []).map((ok) => (ok ? '1' : '0')).join('')).join('|');
+  if (globalCache !== null && globalCache.sig === sig) return globalCache.posts;
+  const views = providers.map((p) => localView(p.id));
+  const n = providers.length;
+  const G: number[][] = [];
+  let totalG = 0;
+  for (let i = 0; i < n; i++) {
+    G.push([]);
+    for (let j = 0; j < n; j++) {
+      let g = 1;
+      for (let p = 0; p < n; p++) g *= views[p].total[p === i ? 1 : 0][p === j ? 1 : 0];
+      G[i].push(g);
+      totalG += g;
+    }
+  }
+  const posts = new Map<string, Posterior>();
+  providers.forEach((provider, p) => {
+    const view = views[p];
+    const hazards: number[] = [0];
+    const anyAccept: boolean[] = new Array<boolean>(19).fill(false);
+    let outageW = 0;
+    for (let i = 0; i < n; i++) outageW += G[i][p];
+    for (let s = 1; s <= 18; s++) {
+      let num = 0;
+      for (let i = 0; i < n; i++) {
+        for (let j = 0; j < n; j++) {
+          const g = G[i][j];
+          if (g === 0) continue;
+          const d = p === i ? 1 : 0;
+          const o = p === j ? 1 : 0;
+          const L = view.total[d][o];
+          if (L > 0) num += g * (view.refuse[d][o][s] / L);
+          if (view.accepts[d][o][s]) anyAccept[s] = true;
+        }
+      }
+      hazards.push(totalG === 0 ? (s === 1 ? 0 : 1) : num / totalG);
+    }
     let deadFrom = 19;
     for (let s = 18; s >= 1; s--) {
-      if (hazards[s] >= 0.999) deadFrom = s;
+      if (!anyAccept[s]) deadFrom = s;
       else break;
     }
-    post = { hazards, deadFrom, outageProb: post.outageProb };
-  }
-  effCache.set(providerId, { sig, post });
-  return post;
+    if (totalG === 0) deadFrom = 2;
+    posts.set(provider.id, { hazards, deadFrom, outageProb: totalG === 0 ? 0 : outageW / totalG });
+  });
+  globalCache = { sig, posts };
+  return posts;
+}
+
+/** The posterior the planner uses for one provider: its slice of the joint posterior above. */
+function effPosterior(providerId: string): Posterior {
+  return globalPosteriors().get(providerId) ?? { hazards: [0, 0], deadFrom: 19, outageProb: 0 };
 }
 
 /** True when the provider's next call, and every call after it, certainly refuses. */
@@ -412,7 +464,7 @@ function hazard(providerId: string, slot: number): number {
 /** The planning cost of a provider's call number `slot`: its refusal probability priced in, a certain refusal priced out. */
 function slotPenalty(providerId: string, slot: number, rc: number): number {
   const h = hazard(providerId, slot);
-  return h * rc + (h >= 0.999 ? 100000 : 0);
+  return h * rc + (h >= 1 - 1e-9 ? 100000 : 0);
 }
 
 interface PlanEntry {
@@ -477,16 +529,17 @@ function planRemaining(fromIdx: number, rc: number): Map<number, PlanEntry> | nu
 }
 
 /**
- * The plan serve() follows: the hazard-priced plan, unless its own quality estimate (against
- * the brief's best table) falls under the floor that keeps the score at its ceiling, in which
+ * The plan serve() follows: the hazard-priced plan, unless its quality estimate for the
+ * whole trial — quality already banked by answered requests plus this plan's, against the
+ * brief's best table — falls under the floor that keeps the score at its ceiling, in which
  * case a quality-leaning plan takes over. Both plans are pure functions of the brief and the
  * outcomes seen so far.
  */
 function planFor(fromIdx: number): Map<number, PlanEntry> | null {
   const manifest = brief.workload?.manifest ?? [];
   const qualityOf = (plan: Map<number, PlanEntry>): number => {
-    let earned = 0;
-    let bound = 0;
+    let earned = servedEarned;
+    let bound = servedBound;
     for (let i = fromIdx; i < manifest.length; i++) {
       const entry = plan.get(i);
       if (entry === undefined) continue;
@@ -613,9 +666,7 @@ async function serve(clientWire: ClientWire, body: Json, req: IncomingMessage, r
     } else {
       const candidates = candidatesFor(clientWire, body, requires);
       candidate =
-        candidates.find((c) => !deadProviders.has(c.probe.provider.id) && !tried.has(`${c.probe.provider.id}/${c.model.id}`)) ??
-        candidates.find((c) => !tried.has(`${c.probe.provider.id}/${c.model.id}`)) ??
-        null;
+        candidates.find((c) => !providerDead(c.probe.provider.id) && !tried.has(`${c.probe.provider.id}/${c.model.id}`)) ?? null;
       if (candidate === null) break;
     }
     const providerId = candidate.probe.provider.id;
@@ -635,6 +686,12 @@ async function serve(clientWire: ClientWire, body: Json, req: IncomingMessage, r
       continue;
     }
     consecutiveRefusals.set(providerId, 0);
+    const servedEntry = (brief.workload?.manifest ?? [])[idx];
+    if (servedEntry !== undefined) {
+      servedEarned += servedEntry.weight * candidate.rating;
+      const bestServed = brief.ratings?.best.find((b) => b.id === servedEntry.id);
+      servedBound += servedEntry.weight * (bestServed?.rating_milli ?? candidate.rating);
+    }
     if (outcome.kind === 'raw_json') {
       const payload = Buffer.from(outcome.bodyText);
       res.writeHead(200, { 'content-type': 'application/json', 'content-length': String(payload.length) });
