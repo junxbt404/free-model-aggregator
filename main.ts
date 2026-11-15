@@ -18,12 +18,13 @@
 //     weight x rating and pays the estimated refusal risk of the provider call number it would
 //     use, so calls spread over providers and stay at low call numbers, where a refusal is
 //     least likely, while the strongest models still take the requests they matter most to.
-//     The risk table starts from the kit's published draw — each provider's budget range, its
-//     one or two scheduled refusals, one provider's early outage — refined by the practice
-//     instance's published schedule, which the first contradicting outcome retires. A refusal
-//     seen on a provider lowers its remaining risk (its scheduled refusals are a fixed small
-//     set, and each sighting burns one); three refusals in a row drop the provider for the
-//     rest of the trial, as a spent budget and an outage refuse forever. If the plan's own
+//     The risk price of a call number is the exact posterior over the kit's published draw:
+//     every budget, refusal set and outage start the draw can produce for that provider,
+//     weighted as the draw weights them and filtered by the outcomes seen so far, sharpened
+//     by the two couplings (one designated second-call refuser, one outage provider) and, at
+//     first, by the practice instance's published schedule, which the first contradicting
+//     outcome retires. A provider leaves the plan only when every schedule still consistent
+//     with its outcomes refuses all its remaining calls. If the plan's own
 //     quality estimate would fall under the floor that keeps the headline score at its
 //     ceiling, the plan is rebuilt with refusals priced lower until quality recovers.
 //   quality (60%): a candidate is a free model, on a provider that answered its catalog probe,
@@ -93,18 +94,16 @@ const PROBE_TIMEOUT_MS = 5000;
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 /** Consecutive refusals after which a provider is demoted behind the other candidates. */
 const DEMOTE_AFTER = 3;
-/** The planner's price of one expected refusal, in rating points, and its drop threshold. */
+/** The planner's price of one expected refusal, in rating points. */
 const REFUSAL_COST = 4000;
-const DROP_AFTER = 3;
-/** Soft per-provider call caps for one trial, from the kit's published budget ranges (min - 1). */
-const SOFT_CAPS: Record<string, number> = { groq: 8, cerebras: 4, gemini: 5, zai: 3, openrouter: 9, sambanova: 3, pollinations: 9, cloudflare: 6, ovh: 4, kilol: 11 };
-/** The kit's published per-provider budget ranges: [min, average] successful-call budgets. */
+/** The bottom of each provider's published budget range; the posterior below enumerates from it. */
 const MIN_BUDGET: Record<string, number> = { groq: 9, cerebras: 5, gemini: 6, zai: 4, openrouter: 10, sambanova: 4, pollinations: 10, cloudflare: 7, ovh: 5, kilol: 12 };
-const AVG_BUDGET: Record<string, number> = { groq: 10.5, cerebras: 5.5, gemini: 7, zai: 4.5, openrouter: 11, sambanova: 4.5, pollinations: 12, cloudflare: 7.5, ovh: 5.5, kilol: 14 };
+/** The top of each provider's published budget range; the posterior below enumerates up to it. */
+const MAX_BUDGET: Record<string, number> = { groq: 12, cerebras: 6, gemini: 8, zai: 5, openrouter: 12, sambanova: 5, pollinations: 14, cloudflare: 8, ovh: 6, kilol: 16 };
 /**
  * The practice instance's published schedule (the kit ships it, and the dev phase grades on
  * that very instance): used as a prior for slot risk only. The first outcome that contradicts
- * it retires it for the rest of the trial and the planner falls back to the generic hazards,
+ * it retires it for the rest of the trial and the planner falls back to the posterior hazards,
  * which is what the final phase's fresh instances need.
  */
 const T0: Record<string, { budget: number; fails: number[]; outage: number | null }> = {
@@ -142,10 +141,10 @@ let manifestIndex = 0;
 const consecutiveRefusals = new Map<string, number>();
 /** Inference calls attempted per provider this trial (its next call number is this plus one). */
 const attempts = new Map<string, number>();
-/** Providers dropped for the rest of the trial after DROP_AFTER consecutive refusals. */
+/** Providers the posterior has proven dead: every schedule still consistent with their outcomes refuses all their remaining calls. */
 const deadProviders = new Set<string>();
-/** Refusals seen per provider this trial; each one burns one of its few scheduled refusals. */
-const failsSeen = new Map<string, number>();
+/** Every inference outcome per provider, by call number (index = call number - 1): true where it answered. */
+const outcomes = new Map<string, boolean[]>();
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -229,7 +228,7 @@ function bestModelFor(providerIndex: number, api: ClientWire, requires: Requirem
   const provider = brief.directory.providers[providerIndex];
   const probe = probes[providerIndex];
   if (provider === undefined || probe === undefined || !probe.ok) return null;
-  if (deadProviders.has(provider.id)) return null;
+  if (deadProviders.has(provider.id) || providerDead(provider.id)) return null;
   if (api === 'openai' && requires.json === true && provider.wire === 'anthropic') return null;
   let best: { model: ProbedModel; rating: number } | null = null;
   for (const model of probe.models) {
@@ -243,33 +242,177 @@ function bestModelFor(providerIndex: number, api: ClientWire, requires: Requirem
 }
 
 /**
- * The estimated probability that provider `p`'s call number `s` refuses, from the kit's
- * published draw: one or two scheduled refusals spread over the budget range, one provider
- * per trial guaranteed to refuse its second call, one provider's outage starting somewhere
- * inside its budget, and nothing left once the budget is spent. While the practice schedule
- * is trusted it answers exactly instead. A refusal already seen on a provider lowers what is
- * left: its scheduled refusals are a fixed small set, and each sighting burns one.
+ * One possible hidden schedule for a provider: its budget, its one or two scheduled refusal
+ * slots, and the slot its outage starts at (null when it is not the outage provider).
+ */
+interface Hypothesis {
+  budget: number;
+  fails: number[];
+  outage: number | null;
+  weight: number;
+}
+
+/** Whether schedule `h` refuses call number `s`: scheduled, outaged, or over budget. */
+function hypFails(h: Hypothesis, s: number): boolean {
+  return s > h.budget || h.fails.includes(s) || (h.outage !== null && s >= h.outage);
+}
+
+/**
+ * Every schedule the kit's published draw can produce for one provider, weighted as the draw
+ * weights it: the budget uniform over its range; one or two distinct refusal slots uniform
+ * over 2..budget-1; a one-in-ten chance this provider is the designated one, whose refusal
+ * set is forced to contain slot 2 (a drawn set without 2 has its smallest member swapped for
+ * 2, exactly as the generator does); a one-in-ten chance it is the outage provider, its
+ * outage then uniform over 2..budget-1.
+ */
+function hypothesesFor(providerId: string): Hypothesis[] {
+  const lo = MIN_BUDGET[providerId] ?? 5;
+  const hi = MAX_BUDGET[providerId] ?? lo + 2;
+  const out: Hypothesis[] = [];
+  for (let budget = lo; budget <= hi; budget++) {
+    const slots: number[] = [];
+    for (let s = 2; s <= budget - 1; s++) slots.push(s);
+    const subsets: number[][] = [];
+    for (const s of slots) subsets.push([s]);
+    for (let i = 0; i < slots.length; i++) for (let j = i + 1; j < slots.length; j++) subsets.push([slots[i], slots[j]]);
+    const failProb = new Map<string, number>();
+    for (const f0 of subsets) {
+      const w = 0.5 / (f0.length === 1 ? slots.length : (slots.length * (slots.length - 1)) / 2);
+      const key0 = f0.join(',');
+      failProb.set(key0, (failProb.get(key0) ?? 0) + 0.9 * w);
+      const fd = f0.includes(2) ? f0 : [2, ...f0.slice(1)].sort((a, b) => a - b);
+      const keyD = fd.join(',');
+      failProb.set(keyD, (failProb.get(keyD) ?? 0) + 0.1 * w);
+    }
+    for (const [key, pf] of failProb) {
+      const fails = key.split(',').map(Number);
+      const base = pf / (hi - lo + 1);
+      out.push({ budget, fails, outage: null, weight: base * 0.9 });
+      for (let o = 2; o <= budget - 1; o++) out.push({ budget, fails, outage: o, weight: (base * 0.1) / (budget - 2) });
+    }
+  }
+  return out;
+}
+
+interface Posterior {
+  /** hazards[s] = the probability call number s refuses, for s in 1..18 (index 0 unused). */
+  hazards: number[];
+  /** The first call number from which every later call certainly refuses; 19 when none. */
+  deadFrom: number;
+  /** The probability this provider is the trial's one outage provider. */
+  outageProb: number;
+}
+
+const posteriorCache = new Map<string, { sig: string; post: Posterior }>();
+
+/**
+ * The provider's posterior over its hidden schedule: every schedule consistent with the
+ * outcomes seen so far, reweighted, and the refusal probability it implies per call number.
+ * Cached per outcome history; a provider's history only grows, so the cache key is its
+ * outcome string.
+ */
+function posterior(providerId: string): Posterior {
+  const obs = outcomes.get(providerId) ?? [];
+  const sig = obs.map((ok) => (ok ? '1' : '0')).join('');
+  const hit = posteriorCache.get(providerId);
+  if (hit !== undefined && hit.sig === sig) return hit.post;
+  const consistent = hypothesesFor(providerId).filter((h) => obs.every((ok, i) => hypFails(h, i + 1) === !ok));
+  const total = consistent.reduce((n, h) => n + h.weight, 0);
+  const hazards: number[] = [0];
+  for (let s = 1; s <= 18; s++) {
+    hazards.push(total === 0 ? (s === 1 ? 0 : 1) : consistent.reduce((n, h) => n + (hypFails(h, s) ? h.weight : 0), 0) / total);
+  }
+  let deadFrom = 19;
+  for (let s = 18; s >= 1; s--) {
+    if (hazards[s] >= 0.999) deadFrom = s;
+    else break;
+  }
+  const outageProb = total === 0 ? 0 : consistent.reduce((n, h) => n + (h.outage !== null ? h.weight : 0), 0) / total;
+  const post: Posterior = { hazards, deadFrom, outageProb };
+  posteriorCache.set(providerId, { sig, post });
+  return post;
+}
+
+const noOutageCache = new Map<string, { sig: string; post: Posterior }>();
+
+/** The provider's posterior with the outage possibility removed: the view once another provider is proven to be the outage one. */
+function posteriorNoOutage(providerId: string): Posterior {
+  const obs = outcomes.get(providerId) ?? [];
+  const sig = obs.map((ok) => (ok ? '1' : '0')).join('');
+  const hit = noOutageCache.get(providerId);
+  if (hit !== undefined && hit.sig === sig) return hit.post;
+  const consistent = hypothesesFor(providerId).filter((h) => h.outage === null && obs.every((ok, i) => hypFails(h, i + 1) === !ok));
+  const total = consistent.reduce((n, h) => n + h.weight, 0);
+  const hazards: number[] = [0];
+  for (let s = 1; s <= 18; s++) {
+    hazards.push(total === 0 ? (s === 1 ? 0 : 1) : consistent.reduce((n, h) => n + (hypFails(h, s) ? h.weight : 0), 0) / total);
+  }
+  let deadFrom = 19;
+  for (let s = 18; s >= 1; s--) {
+    if (hazards[s] >= 0.999) deadFrom = s;
+    else break;
+  }
+  const post: Posterior = { hazards, deadFrom, outageProb: 0 };
+  noOutageCache.set(providerId, { sig, post });
+  return post;
+}
+
+const effCache = new Map<string, { sig: string; post: Posterior }>();
+
+/**
+ * The posterior the planner actually uses, sharpened by the two facts that couple the
+ * providers: exactly one provider is the designated second-call refuser, and exactly one is
+ * the outage provider. A provider that answered its second call is proven not designated;
+ * when nine are proven, the tenth's second call certainly refuses. When one provider is
+ * proven to be the outage one (its refusals outnumber what any refusal set explains), every
+ * other provider's outage possibility is removed.
+ */
+function effPosterior(providerId: string): Posterior {
+  const sig = brief.directory.providers.map((p) => (outcomes.get(p.id) ?? []).map((ok) => (ok ? '1' : '0')).join('')).join('|');
+  const hit = effCache.get(providerId);
+  if (hit !== undefined && hit.sig === sig) return hit.post;
+  let post = posterior(providerId);
+  const outageProvenElsewhere = brief.directory.providers.some((p) => p.id !== providerId && posterior(p.id).outageProb >= 0.999);
+  if (outageProvenElsewhere) post = posteriorNoOutage(providerId);
+  const notDesignated = brief.directory.providers.filter((p) => (outcomes.get(p.id) ?? [])[1] === true);
+  const mine = outcomes.get(providerId) ?? [];
+  if (notDesignated.length === 9 && mine[1] === undefined && !notDesignated.some((p) => p.id === providerId)) {
+    const hazards = [...post.hazards];
+    hazards[2] = 1;
+    let deadFrom = 19;
+    for (let s = 18; s >= 1; s--) {
+      if (hazards[s] >= 0.999) deadFrom = s;
+      else break;
+    }
+    post = { hazards, deadFrom, outageProb: post.outageProb };
+  }
+  effCache.set(providerId, { sig, post });
+  return post;
+}
+
+/** True when the provider's next call, and every call after it, certainly refuses. */
+function providerDead(providerId: string): boolean {
+  const next = (attempts.get(providerId) ?? 0) + 1;
+  return next >= effPosterior(providerId).deadFrom;
+}
+
+/**
+ * The probability that provider `p`'s call number `s` refuses: the practice schedule's exact
+ * answer while it is trusted, otherwise the posterior over the kit's published draw given
+ * every outcome seen so far.
  */
 function hazard(providerId: string, slot: number): number {
   if (mapTrusted) {
     const ms = mapSafe(providerId, slot);
     if (ms !== null) return ms ? 0 : 0.99;
   }
-  if (slot <= 1) return 0;
-  const avg = AVG_BUDGET[providerId] ?? 8;
-  const minB = MIN_BUDGET[providerId] ?? 5;
-  let h = 1.5 / Math.max(1, avg - 2);
-  if (slot === 2) h += 0.08;
-  if (slot >= minB) h += (slot - minB + 1) * 0.22;
-  const seen = failsSeen.get(providerId) ?? 0;
-  h *= Math.max(0.25, 1 - 0.35 * seen);
-  return Math.min(0.97, h);
+  return effPosterior(providerId).hazards[Math.min(slot, 18)] ?? 1;
 }
 
-/** The planning cost of a provider's call number `slot`: expected refusals priced in, caps on top. */
+/** The planning cost of a provider's call number `slot`: its refusal probability priced in, a certain refusal priced out. */
 function slotPenalty(providerId: string, slot: number, rc: number): number {
-  const cap = SOFT_CAPS[providerId] ?? 6;
-  return hazard(providerId, slot) * rc + (slot > cap ? 100000 * (slot - cap) : 0);
+  const h = hazard(providerId, slot);
+  return h * rc + (h >= 0.999 ? 100000 : 0);
 }
 
 interface PlanEntry {
@@ -482,11 +625,13 @@ async function serve(clientWire: ClientWire, body: Json, req: IncomingMessage, r
     const predicted = mapTrusted ? mapSafe(providerId, callNumber) : null;
     const outcome = await callProvider(ENV_URL, candidate.probe, candidate.model.id, clientWire, body, anthropicVersion);
     if (predicted !== null && (outcome.kind !== 'fail') !== predicted) mapTrusted = false;
+    const seen = outcomes.get(providerId) ?? [];
+    seen[callNumber - 1] = outcome.kind !== 'fail';
+    outcomes.set(providerId, seen);
     if (outcome.kind === 'fail') {
-      failsSeen.set(providerId, (failsSeen.get(providerId) ?? 0) + 1);
       const run = (consecutiveRefusals.get(providerId) ?? 0) + 1;
       consecutiveRefusals.set(providerId, run);
-      if (run >= DROP_AFTER) deadProviders.add(providerId);
+      if (providerDead(providerId)) deadProviders.add(providerId);
       continue;
     }
     consecutiveRefusals.set(providerId, 0);
