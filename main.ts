@@ -23,9 +23,7 @@
 //     weighted as the draw weights them and filtered by the outcomes seen so far, under the
 //     joint posterior over the draw's two global choices (which provider is the designated
 //     second-call refuser, which is the outage provider: 100 assignments, reweighted by every
-//     provider's evidence at once) and, at
-//     first, by the practice instance's published schedule, which the first contradicting
-//     outcome retires. A provider leaves the plan only when every schedule still consistent
+//     provider's evidence at once). A provider leaves the plan only when every schedule still consistent
 //     with its outcomes refuses all its remaining calls. If the plan's own
 //     quality estimate would fall under the floor that keeps the headline score at its
 //     ceiling, the plan is rebuilt with refusals priced lower until quality recovers.
@@ -102,35 +100,6 @@ const REFUSAL_COST = 4000;
 const MIN_BUDGET: Record<string, number> = { groq: 9, cerebras: 5, gemini: 6, zai: 4, openrouter: 10, sambanova: 4, pollinations: 10, cloudflare: 7, ovh: 5, kilol: 12 };
 /** The top of each provider's published budget range; the posterior below enumerates up to it. */
 const MAX_BUDGET: Record<string, number> = { groq: 12, cerebras: 6, gemini: 8, zai: 5, openrouter: 12, sambanova: 5, pollinations: 14, cloudflare: 8, ovh: 6, kilol: 16 };
-/**
- * The practice instance's published schedule (the kit ships it, and the dev phase grades on
- * that very instance): used as a prior for slot risk only. The first outcome that contradicts
- * it retires it for the rest of the trial and the planner falls back to the posterior hazards,
- * which is what the final phase's fresh instances need.
- */
-const T0: Record<string, { budget: number; fails: number[]; outage: number | null }> = {
-  groq: { budget: 10, fails: [6, 7], outage: null },
-  cerebras: { budget: 5, fails: [3], outage: null },
-  gemini: { budget: 7, fails: [4, 5], outage: null },
-  zai: { budget: 4, fails: [2], outage: null },
-  openrouter: { budget: 12, fails: [2, 10], outage: null },
-  sambanova: { budget: 4, fails: [3], outage: null },
-  pollinations: { budget: 13, fails: [5], outage: null },
-  cloudflare: { budget: 8, fails: [2, 5], outage: null },
-  ovh: { budget: 6, fails: [3, 4], outage: null },
-  kilol: { budget: 15, fails: [8, 11], outage: 7 },
-};
-let mapTrusted = true;
-/** Whether the practice schedule says provider `p`'s call number `s` succeeds; null when unknown. */
-function mapSafe(p: string, s: number): boolean | null {
-  const m = T0[p];
-  if (m === undefined) return null;
-  if (s > m.budget) return false;
-  if (m.outage !== null && s >= m.outage) return false;
-  if (m.fails.includes(s)) return false;
-  return true;
-}
-
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
 
@@ -449,15 +418,12 @@ function providerDead(providerId: string): boolean {
 }
 
 /**
- * The probability that provider `p`'s call number `s` refuses: the practice schedule's exact
- * answer while it is trusted, otherwise the posterior over the kit's published draw given
- * every outcome seen so far.
+ * The probability that provider `p`'s call number `s` refuses: the posterior over the kit's
+ * published draw given every outcome seen so far. (The practice instance's published
+ * schedule is deliberately not used as a prior: the final instances are drawn independently,
+ * and paired tests showed the posterior alone routes fresh instances better.)
  */
 function hazard(providerId: string, slot: number): number {
-  if (mapTrusted) {
-    const ms = mapSafe(providerId, slot);
-    if (ms !== null) return ms ? 0 : 0.99;
-  }
   return effPosterior(providerId).hazards[Math.min(slot, 18)] ?? 1;
 }
 
@@ -673,9 +639,7 @@ async function serve(clientWire: ClientWire, body: Json, req: IncomingMessage, r
     tried.add(`${providerId}/${candidate.model.id}`);
     const callNumber = (attempts.get(providerId) ?? 0) + 1;
     attempts.set(providerId, callNumber);
-    const predicted = mapTrusted ? mapSafe(providerId, callNumber) : null;
     const outcome = await callProvider(ENV_URL, candidate.probe, candidate.model.id, clientWire, body, anthropicVersion);
-    if (predicted !== null && (outcome.kind !== 'fail') !== predicted) mapTrusted = false;
     const seen = outcomes.get(providerId) ?? [];
     seen[callNumber - 1] = outcome.kind !== 'fail';
     outcomes.set(providerId, seen);
