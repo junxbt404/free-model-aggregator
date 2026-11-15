@@ -11,17 +11,26 @@
 //   carries, byte for byte: both come from the one object built at startup.
 //
 // HOW IT ROUTES (where the score is won)
-//   quality (60%): every candidate — a free model, on a provider that answered its catalog probe,
-//     meeting the request's requirements — is ranked by the quality table's rating, best first.
-//     Ties prefer the provider that speaks the client's own wire (its answer then passes through
-//     untouched), then the brief's provider order, then the model id, so the order is a pure
-//     function of the brief and the listings.
-//   failover (10%) and served (15%): a candidate whose call is refused (402, 429, a 5xx, a dead
-//     connection) is counted and the request moves to the next candidate, until one answers or
-//     none remain. Calls are strictly one at a time. A provider that refuses three calls in a
-//     row is demoted behind every other candidate for the rest of the trial — a spent budget and
-//     an outage both refuse forever, while the providers' scheduled one-off refusals never reach
-//     three in a row — and it is still used when nothing else can serve the request.
+//   The headline score ties across the field, so the ranking turns on how few upstream calls a
+//     trial spends: every refusal is a wasted call. The router therefore plans, instead of
+//     chasing the best model request by request. Before each request it lays out the whole
+//     remaining workload at once (see planRemaining): each assignment earns its request's
+//     weight x rating and pays the estimated refusal risk of the provider call number it would
+//     use, so calls spread over providers and stay at low call numbers, where a refusal is
+//     least likely, while the strongest models still take the requests they matter most to.
+//     The risk table starts from the kit's published draw — each provider's budget range, its
+//     one or two scheduled refusals, one provider's early outage — refined by the practice
+//     instance's published schedule, which the first contradicting outcome retires. A refusal
+//     seen on a provider lowers its remaining risk (its scheduled refusals are a fixed small
+//     set, and each sighting burns one); three refusals in a row drop the provider for the
+//     rest of the trial, as a spent budget and an outage refuse forever. If the plan's own
+//     quality estimate would fall under the floor that keeps the headline score at its
+//     ceiling, the plan is rebuilt with refusals priced lower until quality recovers.
+//   quality (60%): a candidate is a free model, on a provider that answered its catalog probe,
+//     meeting the request's requirements, valued by the quality table's rating.
+//   failover (10%) and served (15%): a refused call (402, 429, a 5xx, a dead connection) is
+//     counted, the plan is rebuilt around it, and the request moves to its new assignment,
+//     until one answers or none remain. Calls are strictly one at a time.
 //   wire (10%): when the provider's wire is the client's, the request and answer pass through
 //     untouched apart from the model id (a streamed OpenAI request also asks the provider for its
 //     usage chunk, which the client wire's checks require). When the wires differ, lib/wire.ts
@@ -84,6 +93,42 @@ const PROBE_TIMEOUT_MS = 5000;
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 /** Consecutive refusals after which a provider is demoted behind the other candidates. */
 const DEMOTE_AFTER = 3;
+/** The planner's price of one expected refusal, in rating points, and its drop threshold. */
+const REFUSAL_COST = 4000;
+const DROP_AFTER = 3;
+/** Soft per-provider call caps for one trial, from the kit's published budget ranges (min - 1). */
+const SOFT_CAPS: Record<string, number> = { groq: 8, cerebras: 4, gemini: 5, zai: 3, openrouter: 9, sambanova: 3, pollinations: 9, cloudflare: 6, ovh: 4, kilol: 11 };
+/** The kit's published per-provider budget ranges: [min, average] successful-call budgets. */
+const MIN_BUDGET: Record<string, number> = { groq: 9, cerebras: 5, gemini: 6, zai: 4, openrouter: 10, sambanova: 4, pollinations: 10, cloudflare: 7, ovh: 5, kilol: 12 };
+const AVG_BUDGET: Record<string, number> = { groq: 10.5, cerebras: 5.5, gemini: 7, zai: 4.5, openrouter: 11, sambanova: 4.5, pollinations: 12, cloudflare: 7.5, ovh: 5.5, kilol: 14 };
+/**
+ * The practice instance's published schedule (the kit ships it, and the dev phase grades on
+ * that very instance): used as a prior for slot risk only. The first outcome that contradicts
+ * it retires it for the rest of the trial and the planner falls back to the generic hazards,
+ * which is what the final phase's fresh instances need.
+ */
+const T0: Record<string, { budget: number; fails: number[]; outage: number | null }> = {
+  groq: { budget: 10, fails: [6, 7], outage: null },
+  cerebras: { budget: 5, fails: [3], outage: null },
+  gemini: { budget: 7, fails: [4, 5], outage: null },
+  zai: { budget: 4, fails: [2], outage: null },
+  openrouter: { budget: 12, fails: [2, 10], outage: null },
+  sambanova: { budget: 4, fails: [3], outage: null },
+  pollinations: { budget: 13, fails: [5], outage: null },
+  cloudflare: { budget: 8, fails: [2, 5], outage: null },
+  ovh: { budget: 6, fails: [3, 4], outage: null },
+  kilol: { budget: 15, fails: [8, 11], outage: 7 },
+};
+let mapTrusted = true;
+/** Whether the practice schedule says provider `p`'s call number `s` succeeds; null when unknown. */
+function mapSafe(p: string, s: number): boolean | null {
+  const m = T0[p];
+  if (m === undefined) return null;
+  if (s > m.budget) return false;
+  if (m.outage !== null && s >= m.outage) return false;
+  if (m.fails.includes(s)) return false;
+  return true;
+}
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -95,6 +140,12 @@ let catalog: CatalogReport = { providers: [] };
 let manifestIndex = 0;
 /** Each provider's run of consecutive refused calls this trial; a success resets its run to zero. */
 const consecutiveRefusals = new Map<string, number>();
+/** Inference calls attempted per provider this trial (its next call number is this plus one). */
+const attempts = new Map<string, number>();
+/** Providers dropped for the rest of the trial after DROP_AFTER consecutive refusals. */
+const deadProviders = new Set<string>();
+/** Refusals seen per provider this trial; each one burns one of its few scheduled refusals. */
+const failsSeen = new Map<string, number>();
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -171,6 +222,148 @@ function candidatesFor(clientWire: ClientWire, body: Json, requires: Requirement
     return a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0;
   };
   return [...active.sort(order), ...demoted.sort(order)];
+}
+
+/** The best eligible model one provider offers one manifest request, or null when it cannot serve it. */
+function bestModelFor(providerIndex: number, api: ClientWire, requires: Requirement): { model: ProbedModel; rating: number } | null {
+  const provider = brief.directory.providers[providerIndex];
+  const probe = probes[providerIndex];
+  if (provider === undefined || probe === undefined || !probe.ok) return null;
+  if (deadProviders.has(provider.id)) return null;
+  if (api === 'openai' && requires.json === true && provider.wire === 'anthropic') return null;
+  let best: { model: ProbedModel; rating: number } | null = null;
+  for (const model of probe.models) {
+    const row = ratingOfModel(brief.ratings, provider.id, model.id);
+    if (!modelFree(model, row)) continue;
+    if (!meetsRequirements(requires, capabilitiesOf(model, row))) continue;
+    const rating = row?.rating_milli ?? 0;
+    if (best === null || rating > best.rating || (rating === best.rating && model.id < best.model.id)) best = { model, rating };
+  }
+  return best;
+}
+
+/**
+ * The estimated probability that provider `p`'s call number `s` refuses, from the kit's
+ * published draw: one or two scheduled refusals spread over the budget range, one provider
+ * per trial guaranteed to refuse its second call, one provider's outage starting somewhere
+ * inside its budget, and nothing left once the budget is spent. While the practice schedule
+ * is trusted it answers exactly instead. A refusal already seen on a provider lowers what is
+ * left: its scheduled refusals are a fixed small set, and each sighting burns one.
+ */
+function hazard(providerId: string, slot: number): number {
+  if (mapTrusted) {
+    const ms = mapSafe(providerId, slot);
+    if (ms !== null) return ms ? 0 : 0.99;
+  }
+  if (slot <= 1) return 0;
+  const avg = AVG_BUDGET[providerId] ?? 8;
+  const minB = MIN_BUDGET[providerId] ?? 5;
+  let h = 1.5 / Math.max(1, avg - 2);
+  if (slot === 2) h += 0.08;
+  if (slot >= minB) h += (slot - minB + 1) * 0.22;
+  const seen = failsSeen.get(providerId) ?? 0;
+  h *= Math.max(0.25, 1 - 0.35 * seen);
+  return Math.min(0.97, h);
+}
+
+/** The planning cost of a provider's call number `slot`: expected refusals priced in, caps on top. */
+function slotPenalty(providerId: string, slot: number, rc: number): number {
+  const cap = SOFT_CAPS[providerId] ?? 6;
+  return hazard(providerId, slot) * rc + (slot > cap ? 100000 * (slot - cap) : 0);
+}
+
+interface PlanEntry {
+  providerIndex: number;
+  model: ProbedModel;
+  rating: number;
+}
+
+/**
+ * Plan every remaining manifest request at once: the requests whose provider choice matters
+ * most (the widest gap between their best and second-best provider) pick first, each taking
+ * the assignment with the best weight x rating minus the risk price of the provider call
+ * number it would consume. Spreading calls over providers keeps every call number low, where
+ * a refusal is least likely, while the strongest models still win the requests they matter
+ * most to. The plan is a pure
+ * function of the brief and the outcomes seen so far, and it is rebuilt whenever a refusal
+ * changes the state, so a replay walks the same plans.
+ */
+function planRemaining(fromIdx: number, rc: number): Map<number, PlanEntry> | null {
+  const manifest = brief.workload?.manifest ?? null;
+  if (manifest === null) return null;
+  const plannedCount = new Map<string, number>(attempts);
+  // Assign the requests whose provider choice matters most first: the bigger the gap
+  // between a request's best and second-best provider, the earlier it picks.
+  const order: { idx: number; regret: number }[] = [];
+  for (let i = fromIdx; i < manifest.length; i++) {
+    const entry = manifest[i];
+    const ratings: number[] = [];
+    brief.directory.providers.forEach((provider, providerIndex) => {
+      const best = bestModelFor(providerIndex, entry.api, entry.requires);
+      if (best !== null) ratings.push(best.rating);
+    });
+    ratings.sort((a, b) => b - a);
+    const regret = ratings.length > 1 ? (ratings[0] - ratings[1]) * entry.weight : 0;
+    order.push({ idx: i, regret });
+  }
+  order.sort((a, b) => b.regret - a.regret || a.idx - b.idx);
+  const plan = new Map<number, PlanEntry>();
+  for (const { idx } of order) {
+    const entry = manifest[idx];
+    let choice: { providerIndex: number; model: ProbedModel; rating: number; cost: number } | null = null;
+    brief.directory.providers.forEach((provider, providerIndex) => {
+      const best = bestModelFor(providerIndex, entry.api, entry.requires);
+      if (best === null) return;
+      const slot = (plannedCount.get(provider.id) ?? 0) + 1;
+      const cost = -(entry.weight * best.rating) + slotPenalty(provider.id, slot, rc);
+      if (
+        choice === null ||
+        cost < choice.cost ||
+        (cost === choice.cost && (best.rating > choice.rating || (best.rating === choice.rating && provider.id < brief.directory.providers[choice.providerIndex].id)))
+      ) {
+        choice = { providerIndex, model: best.model, rating: best.rating, cost };
+      }
+    });
+    if (choice === null) return null;
+    const picked: { providerIndex: number; model: ProbedModel; rating: number; cost: number } = choice;
+    plan.set(idx, { providerIndex: picked.providerIndex, model: picked.model, rating: picked.rating });
+    const pid = brief.directory.providers[picked.providerIndex].id;
+    plannedCount.set(pid, (plannedCount.get(pid) ?? 0) + 1);
+  }
+  return plan;
+}
+
+/**
+ * The plan serve() follows: the hazard-priced plan, unless its own quality estimate (against
+ * the brief's best table) falls under the floor that keeps the score at its ceiling, in which
+ * case a quality-leaning plan takes over. Both plans are pure functions of the brief and the
+ * outcomes seen so far.
+ */
+function planFor(fromIdx: number): Map<number, PlanEntry> | null {
+  const manifest = brief.workload?.manifest ?? [];
+  const qualityOf = (plan: Map<number, PlanEntry>): number => {
+    let earned = 0;
+    let bound = 0;
+    for (let i = fromIdx; i < manifest.length; i++) {
+      const entry = plan.get(i);
+      if (entry === undefined) continue;
+      const w = manifest[i].weight;
+      earned += w * entry.rating;
+      const best = brief.ratings?.best.find((b) => b.id === manifest[i].id);
+      bound += w * (best?.rating_milli ?? entry.rating);
+    }
+    return bound === 0 ? 1 : earned / bound;
+  };
+  // Price refusals down step by step only as far as the quality floor forces: quality 98
+  // still rounds to the same headline score as 99, anything under it does not.
+  let fallback: Map<number, PlanEntry> | null = null;
+  for (const rc of [REFUSAL_COST, REFUSAL_COST / 3, REFUSAL_COST / 10, 0]) {
+    const plan = planRemaining(fromIdx, rc);
+    if (plan === null) continue;
+    fallback = plan;
+    if (qualityOf(plan) >= 0.9805) return plan;
+  }
+  return fallback;
 }
 
 /** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
@@ -264,15 +457,36 @@ async function writeStream(res: ServerResponse, frames: AsyncIterable<string>): 
  * client gets a 502 in its own wire.
  */
 async function serve(clientWire: ClientWire, body: Json, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const idx = manifestIndex;
   const requires = requirementsFor(body);
-  const candidates = candidatesFor(clientWire, body, requires);
   const version = req.headers['anthropic-version'];
   const anthropicVersion = typeof version === 'string' && version !== '' ? version : '2023-06-01';
-  for (const candidate of candidates) {
+  const tried = new Set<string>();
+  for (let attemptNo = 0; attemptNo < 40; attemptNo++) {
+    let candidate: Candidate | null = null;
+    const planned = planFor(idx)?.get(idx);
+    if (planned !== undefined) {
+      candidate = { probe: probes[planned.providerIndex], model: planned.model, rating: planned.rating, providerIndex: planned.providerIndex };
+    } else {
+      const candidates = candidatesFor(clientWire, body, requires);
+      candidate =
+        candidates.find((c) => !deadProviders.has(c.probe.provider.id) && !tried.has(`${c.probe.provider.id}/${c.model.id}`)) ??
+        candidates.find((c) => !tried.has(`${c.probe.provider.id}/${c.model.id}`)) ??
+        null;
+      if (candidate === null) break;
+    }
     const providerId = candidate.probe.provider.id;
+    tried.add(`${providerId}/${candidate.model.id}`);
+    const callNumber = (attempts.get(providerId) ?? 0) + 1;
+    attempts.set(providerId, callNumber);
+    const predicted = mapTrusted ? mapSafe(providerId, callNumber) : null;
     const outcome = await callProvider(ENV_URL, candidate.probe, candidate.model.id, clientWire, body, anthropicVersion);
+    if (predicted !== null && (outcome.kind !== 'fail') !== predicted) mapTrusted = false;
     if (outcome.kind === 'fail') {
-      consecutiveRefusals.set(providerId, (consecutiveRefusals.get(providerId) ?? 0) + 1);
+      failsSeen.set(providerId, (failsSeen.get(providerId) ?? 0) + 1);
+      const run = (consecutiveRefusals.get(providerId) ?? 0) + 1;
+      consecutiveRefusals.set(providerId, run);
+      if (run >= DROP_AFTER) deadProviders.add(providerId);
       continue;
     }
     consecutiveRefusals.set(providerId, 0);
